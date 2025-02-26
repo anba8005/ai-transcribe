@@ -23,6 +23,8 @@ class Transcribe:
 
             start = segment[0] * 1000   # start time in miliseconds
             end = segment[1] * 1000     # end time in miliseconds
+            if (end - start <= 0):
+                continue
             clip = self.audio[start:end]
             i = i + 1
             file = self.tmp_folder + "/" + "segment"+ str(i) + ".wav"
@@ -30,7 +32,7 @@ class Transcribe:
 
             try:
                 trans = self.transcribe(file)  
-                texts.append([segment[0], segment[1], trans])
+                texts.append([segment[0], segment[1], trans, segment[2]])
             except Exception as err:
                 print("ERROR while transcribing: ", err)
 
@@ -40,7 +42,7 @@ class Transcribe:
         return texts
     
     def transcribe(self, file_name):
-        segments, info = self.whisper_model.transcribe(file_name, language=self.language, beam_size=5)
+        segments, info = self.whisper_model.transcribe(file_name, language=self.language, beam_size=5, condition_on_previous_text=False)
         res = ""
         for segment in segments:
             res += segment.text + " "

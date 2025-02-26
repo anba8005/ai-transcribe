@@ -1,6 +1,7 @@
 import logging
 import time
 import os
+from diarize import Diarize
 from identify import Identify
 import torch # type: ignore
 import torchaudio # type: ignore
@@ -8,6 +9,7 @@ from pyannote.audio import Pipeline  # type: ignore
 import gc
 
 from transcribe import Transcribe
+from vad import VAD
 
 logger = logging.getLogger(__name__)
 
@@ -28,103 +30,77 @@ def process(audio, device_name, hf_token, batch_size, model, language, voices_fo
         os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 
 
-    # Create diarization pipeline
-    speaker_tags = []
-    pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization@2.1",
-                                    use_auth_token=hf_token)
-    pipeline.to(device)
+    # load audio
     waveform, sample_rate = torchaudio.load(audio)
+    if sample_rate != 16000:
+        raise ValueError("Sample rate must be 16000")
 
 
-    # Diarize file
+    # perform VAD
+    logger.info("running VAD...")
     start_time = int(time.time())
+    #
+    vad = VAD(device)
+    vad_waveform = vad.process(waveform)
+    #
+    end_time = int(time.time())
+    elapsed_time = int(end_time - start_time)
+    logger.info(f"VAD done. Time taken: {elapsed_time} seconds.")
+    
+
+    # Create diarization pipeline
     logger.info("running diarization...")
-    diarization = pipeline({"waveform": waveform, "sample_rate": sample_rate}, min_speakers=0, max_speakers=10)
+    start_time = int(time.time())
+    #
+    diarize = Diarize(device, hf_token)
+    segments = diarize.process(vad_waveform)
+    #
     end_time = int(time.time())
     elapsed_time = int(end_time - start_time)
     logger.info(f"diarization done. Time taken: {elapsed_time} seconds.")
 
-    # create a dictionary of SPEAKER_XX to real name mappings
-    speaker_map = {}
-    speakers = {}
-    common = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-
-        start = round(turn.start, 1)
-        end = round(turn.end, 1)
-        common.append([start, end, speaker])
-
-        # find different speakers
-        if speaker not in speaker_tags:
-            speaker_tags.append(speaker)
-            speaker_map[speaker] = speaker
-            speakers[speaker] = []
-
-        speakers[speaker].append([start, end, speaker])
-
 
     # identify speakers
     if voices_folder != None and voices_folder != "":
-        identify = Identify(device)
-        identified = []
-
         start_time = int(time.time())
         logger.info("running speaker recognition...")
-        for spk_tag, spk_segments in speakers.items():
-            spk_name = identify.speaker_recognition(audio, voices_folder, spk_segments, identified, tmp_folder)
-            spk = spk_name
-            identified.append(spk)
-            speaker_map[spk_tag] = spk
+        #
+        identify = Identify(device, voices_folder, tmp_folder)
+        identified = identify.process(audio, segments)
+        #
         end_time = int(time.time())
         elapsed_time = int(end_time - start_time)
         logger.info(f"speaker recognition done. Time taken: {elapsed_time} seconds.")
 
 
-    # merging same speakers
-    keys_to_remove = []
+    # merge consecutive segments with the same speaker
     merged = []
-    for spk_tag1, _ in speakers.items():
-        for spk_tag2, spk_segments2 in speakers.items():
-            if spk_tag1 not in merged and spk_tag2 not in merged and spk_tag1 != spk_tag2 and speaker_map[spk_tag1] == speaker_map[spk_tag2]:
-                for segment in spk_segments2:
-                    speakers[spk_tag1].append(segment)
+    if len(identified) > 0:
+        current = identified[0]
+        for next_segment in identified[1:]:
+            # If same speaker and gap is <= 1 second
+            if (current[2] == next_segment[2] and next_segment[0] - current[1] <= 1):
+                # Merge by extending end time
+                print('merging segments')
+                current[1] = next_segment[1]
+            else:
+                merged.append(current)
+                current = next_segment
+                
+        # Add the last segment
+        merged.append(current)
 
-                merged.append(spk_tag1)
-                merged.append(spk_tag2)
-                keys_to_remove.append(spk_tag2)
-    
-    # fixing the speaker names in common
-    for segment in common:
-        speaker = segment[2]
-        segment[2] = speaker_map[speaker]
 
-    for key in keys_to_remove:
-        del speakers[key]
-        del speaker_map[key]
-    
-    # transcribing the texts differently according to speaker
-    transcribe = Transcribe(audio, model, language, device_name, tmp_folder)
+    # transcribing the texts segment by segment
     start_time = int(time.time())
     logger.info("running transcription...")
-    for spk_tag, spk_segments in speakers.items():
-        spk = speaker_map[spk_tag]
-        segment_out = transcribe.segment_transcription(spk_segments)
-        speakers[spk_tag] = segment_out
+    #
+    transcribe = Transcribe(audio, model, language, device_name, tmp_folder)
+    result = transcribe.segment_transcription(merged)
+    #
     end_time = int(time.time())
     elapsed_time = int(end_time - start_time)
     logger.info(f"transcription done. Time taken: {elapsed_time} seconds.")
 
-    common_segments = []
-
-    for item in common:
-        speaker = item[2]
-        start = item[0]
-        end = item[1]
-
-        for spk_tag, spk_segments in speakers.items():
-            if speaker == speaker_map[spk_tag]:
-                for segment in spk_segments:
-                    if start == segment[0] and end == segment[1]:
-                        common_segments.append([start, end, segment[2], speaker])
-
-    return common_segments
+       
+    return result
