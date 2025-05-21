@@ -71,7 +71,8 @@ def process(audio, device_name, hf_token, batch_size, model, language, voices_fo
         end_time = int(time.time())
         elapsed_time = int(end_time - start_time)
         logger.info(f"speaker recognition done. Time taken: {elapsed_time} seconds.")
-
+    else:
+        identified = segments;
 
     # merge consecutive segments with the same speaker
     merged = []
